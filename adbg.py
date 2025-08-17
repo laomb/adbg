@@ -15,7 +15,7 @@ from typing import Optional, Tuple, Dict, List
 
 from capstone import Cs, CS_ARCH_X86, CS_MODE_16, CS_MODE_32
 from capstone.x86 import X86_OP_IMM, X86_OP_MEM
-from capstone.x86_const import X86_INS_RET, X86_INS_RETF
+from capstone.x86_const import X86_INS_RET, X86_INS_RETF, X86_INS_CALL
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("adbg_cli")
@@ -821,6 +821,40 @@ class ADbgCLI(cmd.Cmd):
             print(f"Step error: {e}")
 
     do_s = do_step
+
+    def do_next(self, arg):
+        try:
+            regs = self.rsp.get_regs()
+            md = self.dasm.update_mode(regs)
+
+            code = self.rsp.read_mem(regs["EIP"], 16)
+            insns = list(md.disasm(code, regs["EIP"], count=1))
+            if not insns:
+                print("next: failed to decode current instruction")
+                return
+            ins = insns[0]
+            next_addr = ins.address + ins.size
+
+            if ins.id == X86_INS_CALL:
+                try:
+                    self.rsp.set_break(next_addr)
+                except Exception as e:
+                    print(f"next: failed to set temporary breakpoint: {e}")
+                    return
+                try:
+                    self.rsp.cont()
+                finally:
+                    try:
+                        self.rsp.remove_break(next_addr)
+                    except Exception:
+                        pass
+                self.print_disasm(1)
+            else:
+                self.do_step(arg)
+        except Exception as e:
+            print(f"next error: {e}")
+
+    do_n = do_next
 
     def do_cont(self, arg):
         try:
