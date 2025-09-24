@@ -11,11 +11,24 @@ import re
 import os
 import math
 import bisect
+import time
+from collections import deque
 from typing import Optional, Tuple, Dict, List
 
 from capstone import Cs, CS_ARCH_X86, CS_MODE_16, CS_MODE_32
-from capstone.x86 import X86_OP_IMM, X86_OP_MEM
-from capstone.x86_const import X86_INS_RET, X86_INS_RETF
+
+from capstone.x86_const import (
+    X86_OP_IMM,
+    X86_OP_MEM,
+    X86_REG_EIP,
+    X86_INS_CALL,
+    X86_INS_JMP,
+    X86_GRP_JUMP,
+    X86_GRP_CALL,
+    X86_GRP_INT,
+    X86_INS_RET,
+    X86_INS_RETF,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("adbg_cli")
@@ -158,28 +171,49 @@ class FasFile:
         if off_in_strtab == 0:
             return ""
         start = self.off_str + off_in_strtab
-        end = self.data.find(b"\x00", start, self.off_str + self.len_str)
+        sect_end = self.off_str + self.len_str
+        if start < self.off_str or start >= sect_end:
+            self._log_bad_offset("strtab", start)
+            return ""
+        end = self.data.find(b"\x00", start, sect_end)
         if end == -1:
-            end = self.off_str + self.len_str
+            end = sect_end
+        if end < start or end > sect_end:
+            self._log_bad_offset("strtab", start)
+            return ""
         return self.data[start:end].decode("utf-8", errors="replace")
 
     def get_cstr_from_preproc(self, off_in_preproc) -> str:
         if off_in_preproc == 0:
             return ""
         start = self.off_src + off_in_preproc
-        end = self.data.find(b"\x00", start, self.off_src + self.len_src)
+        sect_end = self.off_src + self.len_src
+        if start < self.off_src or start >= sect_end:
+            self._log_bad_offset("preproc-cstr", start)
+            return ""
+        end = self.data.find(b"\x00", start, sect_end)
         if end == -1:
-            end = self.off_src + self.len_src
+            end = sect_end
+        if end < start or end > sect_end:
+            self._log_bad_offset("preproc-cstr", start)
+            return ""
         return self.data[start:end].decode("utf-8", errors="replace")
 
     def get_pascal_from_preproc(self, off_in_preproc) -> str:
         if off_in_preproc == 0:
             return ""
         p = self.off_src + off_in_preproc
-        if p >= self.off_src + self.len_src:
+        sect_end = self.off_src + self.len_src
+        if p < self.off_src or p >= sect_end:
+            self._log_bad_offset("preproc-pascal", p)
             return ""
         ln = u8(self.data, p)
-        s = self.data[p + 1 : p + 1 + ln]
+        start = p + 1
+        end = start + ln
+        if start > sect_end or end > sect_end or end < start:
+            self._log_bad_offset("preproc-pascal", p)
+            return ""
+        s = self.data[start:end]
         return s.decode("utf-8", errors="replace")
 
     def _parse_sections(self):
@@ -295,6 +329,14 @@ class FasFile:
                         addr, (file_name, lm["line_no"], macro_name, lm["generated"])
                     )
 
+    def _log_bad_offset(self, what: str, off: int):
+        start = max(0, off - 16)
+        end = min(len(self.data), off + 16)
+        snippet = " ".join(f"{b:02x}" for b in self.data[start:end])
+        logger.warning(
+            "FAS: invalid offset in %s at 0x%x; around: %s", what, off, snippet
+        )
+
 
 def parse_fas(path):
     with open(path, "rb") as f:
@@ -355,11 +397,26 @@ class RSPClient:
         raw = payload.encode()
         chk = self._checksum(raw)
         pkt = b"$" + raw + b"#" + f"{chk:02x}".encode()
-        self.sock.send(pkt)
-        ack = self.sock.recv(1)
-        if ack != b"+":
-            raise IOError("No ACK from stub")
-        return self._read_packet()
+        attempt = 0
+        last_stage = "send"
+        while attempt < 2:
+            try:
+                last_stage = "send"
+                self.sock.send(pkt)
+                last_stage = "recv-ack"
+                ack = self.sock.recv(1)
+                if ack != b"+":
+                    raise IOError("No ACK from stub")
+                last_stage = "recv-packet"
+                return self._read_packet()
+            except Exception as e:
+                attempt += 1
+                if attempt >= 2:
+                    head = payload[:16]
+                    raise IOError(
+                        f"RSP _send_packet failed during {last_stage}: payload='{head}' expected_ack='+' error={e}"
+                    )
+                time.sleep(0.05)
 
     def get_regs(self) -> dict:
         raw = self._send_packet("g")
@@ -422,10 +479,23 @@ class RSPClient:
 class Disassembler:
     def __init__(self, default_mode="x86_16"):
         self.mode = default_mode
+        self._syntax = "intel"
         self.cs = Cs(
             CS_ARCH_X86, CS_MODE_16 if default_mode == "x86_16" else CS_MODE_32
         )
         self.cs.detail = True
+        self._apply_syntax()
+
+    def _apply_syntax(self):
+        try:
+            from capstone import CS_OPT_SYNTAX_ATT, CS_OPT_SYNTAX_INTEL
+
+            self.cs.syntax = (
+                CS_OPT_SYNTAX_INTEL if self._syntax == "intel" else CS_OPT_SYNTAX_ATT
+            )
+        except Exception:
+            pass
+        return self.cs
 
     def update_mode(self, regs: dict):
         vm86 = bool(regs["EFLAGS"] & (1 << 17))
@@ -435,8 +505,13 @@ class Disassembler:
             m = CS_MODE_16 if vm86 else CS_MODE_32
             self.cs = Cs(CS_ARCH_X86, m)
             self.cs.detail = True
+            self._apply_syntax()
             logger.info(f"Switched disassembler to {self.mode}")
         return self.cs
+
+    def set_syntax(self, syntax: str):
+        self._syntax = "att" if syntax.lower() == "att" else "intel"
+        self._apply_syntax()
 
 
 def hexdump(addr: int, data: bytes, width: int = 16):
@@ -457,6 +532,20 @@ class MergedFas:
                 self.addr2line.setdefault(addr, src)
         self._sorted_addrs = sorted(self.addr2line.keys())
 
+        self._intervals: List[Tuple[int, int, Tuple[str, int, str, bool]]] = []
+        if self._sorted_addrs:
+            for idx, start in enumerate(self._sorted_addrs):
+                end = (
+                    self._sorted_addrs[idx + 1]
+                    if idx + 1 < len(self._sorted_addrs)
+                    else start + 1
+                )
+                meta = self.addr2line[start]
+                if end <= start:
+                    end = start + 1
+                self._intervals.append((start, end, meta))
+        self._interval_starts: List[int] = [s for s, _, _ in self._intervals]
+
     def get_line_exact(self, addr: int) -> Optional[Tuple[str, int, str, bool]]:
         return self.addr2line.get(addr)
 
@@ -467,6 +556,107 @@ class MergedFas:
         if i == 0:
             return None
         return self.addr2line.get(self._sorted_addrs[i - 1])
+
+    def get_line_covering(self, addr: int) -> Optional[Tuple[str, int, str, bool]]:
+        if not self._intervals:
+            return None
+        i = bisect.bisect_right(self._interval_starts, addr) - 1
+        if i < 0:
+            return None
+        start, end, meta = self._intervals[i]
+        if start <= addr < end:
+            return meta
+        return None
+
+
+class CFG:
+    def __init__(self):
+        self.adj: Dict[int, Dict[int, int]] = {}
+        self.visits: Dict[int, int] = {}
+        self.first_seen: Dict[int, float] = {}
+        self.last_seen: Dict[int, float] = {}
+
+    def add_node(self, u: int, ts: float):
+        if u not in self.visits:
+            self.visits[u] = 0
+            self.first_seen[u] = ts
+        self.last_seen[u] = ts
+        self.visits[u] += 1
+
+    def add_edge(self, u: int, v: int, ts: float):
+        self.add_node(u, ts)
+        self.add_node(v, ts)
+        self.adj.setdefault(u, {}).setdefault(v, 0)
+        self.adj[u][v] += 1
+
+    def nodes(self):
+        return self.visits.keys()
+
+    def edges(self):
+        for u, nbrs in self.adj.items():
+            for v, c in nbrs.items():
+                yield (u, v, c)
+
+    def top_nodes(self, k=10):
+        return sorted(self.visits.items(), key=lambda kv: kv[1], reverse=True)[:k]
+
+    def top_edges(self, k=10):
+        return sorted(self.edges(), key=lambda e: e[2], reverse=True)[:k]
+
+    def sccs(self) -> List[set]:
+        index = 0
+        stack: List[int] = []
+        onstack: Dict[int, bool] = {}
+        indices: Dict[int, int] = {}
+        lowlink: Dict[int, int] = {}
+        result: List[set] = []
+
+        def strongconnect(v: int):
+            nonlocal index
+            indices[v] = index
+            lowlink[v] = index
+            index += 1
+            stack.append(v)
+            onstack[v] = True
+            for w in self.adj.get(v, {}):
+                if w not in indices:
+                    strongconnect(w)
+                    lowlink[v] = min(lowlink[v], lowlink[w])
+                elif onstack.get(w, False):
+                    lowlink[v] = min(lowlink[v], indices[w])
+            if lowlink[v] == indices[v]:
+                comp = set()
+                while True:
+                    w = stack.pop()
+                    onstack[w] = False
+                    comp.add(w)
+                    if w == v:
+                        break
+                result.append(comp)
+
+        for v in list(self.nodes()):
+            if v not in indices:
+                strongconnect(v)
+        return result
+
+
+def extract_scc_containing(
+    cfg: CFG, node: int, region: Optional[Tuple[int, int]] = None
+):
+    in_region = lambda addr: True if region is None else (region[0] <= addr < region[1])
+    for comp in cfg.sccs():
+        if node in comp:
+            has_out = False
+            for u in comp:
+                for v in cfg.adj.get(u, {}):
+                    if v not in comp and in_region(v):
+                        has_out = True
+                        break
+                if has_out:
+                    break
+            return comp, has_out
+
+    return {node}, False
 
 
 class ADbgCLI(cmd.Cmd):
@@ -494,11 +684,21 @@ class ADbgCLI(cmd.Cmd):
         self.addr2sym = addr2sym
         self.fas = fas
 
+        self._sym_index: List[Tuple[int, str]] = sorted(
+            ((addr, name) for name, addr in self.sym2addr.items()),
+            key=lambda x: x[0],
+        )
+        self._sym_addrs: List[int] = [a for a, _ in self._sym_index]
+        self._sym_conflicts: Dict[str, List[int]] = getattr(self, "_sym_conflicts", {})
+
         self.breakpoints: Dict[int, int] = {}
         self.next_bp_id = 1
 
         self.watchpoints: Dict[int, Tuple[int, int, int]] = {}
         self.next_wp_id = 1
+
+        self._show_bytes: bool = False
+        self._show_ann: bool = True
 
         self.reg_width = default_reg_width
 
@@ -552,25 +752,27 @@ class ADbgCLI(cmd.Cmd):
         raise ValueError(f"Unknown symbol/address: {tok}")
 
     def _nearest_symbol(self, addr: int):
-        best = None
-        best_addr = None
-        for name, a in self.sym2addr.items():
-            if a <= addr and (best_addr is None or a > best_addr):
-                best, best_addr = name, a
-        if best is None:
+        i = bisect.bisect_right(self._sym_addrs, addr)
+        if i == 0:
             return None
-        return best, best_addr, addr - best_addr
+        base_addr, name = self._sym_index[i - 1]
+        return name, base_addr, addr - base_addr
 
-    def _format_symbol(self, addr: int) -> str:
+    def _format_symbol(
+        self, addr: int, *, exact_only: bool = False, max_delta: int = 0x20
+    ) -> str:
         sym = self.addr2sym.get(addr)
         if sym:
             return f"{C.CYAN}{sym}{C.RESET}"
+        if exact_only:
+            return f"0x{addr:08x}"
         near = self._nearest_symbol(addr)
         if near:
             name, base, off = near
             if off == 0:
                 return f"{C.CYAN}{name}{C.RESET}"
-            return f"{C.CYAN}{name}+0x{off:x}{C.RESET}"
+            if off <= max_delta:
+                return f"{C.CYAN}{name}+0x{off:x}{C.RESET}"
         return f"0x{addr:08x}"
 
     def _get_reg(self, regs: dict, name: str) -> int:
@@ -677,17 +879,75 @@ class ADbgCLI(cmd.Cmd):
         else:
             print("Unsupported register width; use 8, 16, or 32.")
 
+    def _is_ctrl_flow(self, ins) -> bool:
+        if hasattr(ins, "groups") and (
+            X86_GRP_JUMP in ins.groups or X86_GRP_CALL in ins.groups
+        ):
+            return True
+        m = ins.mnemonic
+        return m == "call" or m == "jmp" or (m and m.startswith("j"))
+
     def _annotate_operands(self, ins) -> List[str]:
         anns: List[str] = []
+
+        try:
+            if self.dasm.mode == "x86_32" and self._is_ctrl_flow(ins):
+                for op in getattr(ins, "operands", []):
+                    if op.type == X86_OP_IMM:
+                        target = int(op.imm) & 0xFFFFFFFF
+                        cur = (ins.address + ins.size) & 0xFFFFFFFF
+                        disp = (target - cur) & 0xFFFFFFFF
+
+                        sign = "+" if target >= cur else "-"
+                        delta = disp if sign == "+" else ((cur - target) & 0xFFFFFFFF)
+                        anns.append(f"eip{sign}0x{delta:x}")
+        except Exception:
+            pass
+
+        if hasattr(ins, "groups") and X86_GRP_INT in ins.groups:
+            return anns
+        if ins.mnemonic and ins.mnemonic.startswith("int"):
+            return anns
+
         for op in getattr(ins, "operands", []):
             if op.type == X86_OP_IMM:
                 target = int(op.imm) & 0xFFFFFFFF
-                anns.append(f"→ {self._format_symbol(target)}")
+
+                if target < 0x100:
+                    lab = self.addr2sym.get(target)
+                    if lab:
+                        anns.append(f"→ {self._format_symbol(target, exact_only=True)}")
+                    continue
+
+                if self._is_ctrl_flow(ins):
+                    anns.append(
+                        f"→ {self._format_symbol(target, exact_only=False, max_delta=0x20)}"
+                    )
+                else:
+                    lab = self.addr2sym.get(target)
+                    if lab:
+                        anns.append(f"→ {self._format_symbol(target, exact_only=True)}")
+
             elif op.type == X86_OP_MEM:
                 mem = op.mem
                 if mem.base == 0 and mem.index == 0:
                     addr = mem.disp & 0xFFFFFFFF
-                    anns.append(f"[{self._format_symbol(addr)}]")
+                    anns.append(
+                        f"[{self._format_symbol(addr, exact_only=False, max_delta=0x100)}]"
+                    )
+                try:
+                    if self.dasm.mode == "x86_32" and mem.base == X86_REG_EIP:
+                        disp = mem.disp & 0xFFFFFFFF
+                        sign = "+" if mem.disp >= 0 else "-"
+                        delta = mem.disp if mem.disp >= 0 else (-mem.disp)
+                        target = (ins.address + ins.size + mem.disp) & 0xFFFFFFFF
+                        anns.append(f"[eip{sign}0x{delta:x}]")
+                        anns.append(
+                            f"→ {self._format_symbol(target, exact_only=False, max_delta=0x100)}"
+                        )
+                except Exception:
+                    pass
+
         return anns
 
     def print_disasm(self, count=5, addr=None):
@@ -695,8 +955,6 @@ class ADbgCLI(cmd.Cmd):
         if addr is None:
             addr = regs["EIP"]
         md = self.dasm.update_mode(regs)
-
-        code = self.rsp.read_mem(addr, count * 16)
 
         last_src_key = None
         printed = 0
@@ -709,54 +967,99 @@ class ADbgCLI(cmd.Cmd):
         if start_sym:
             print(f"{C.MAGENTA}{start_sym}:{C.RESET}")
 
-        for ins in md.disasm(code, addr):
-            if printed >= count:
+        cap = 512
+        cur_addr = addr
+        buf = b""
+        total_read = 0
+        while printed < count and total_read < cap:
+            if len(buf) < 16 and total_read < cap:
+                to_read = min(64, cap - total_read)
+                try:
+                    chunk = self.rsp.read_mem(cur_addr + len(buf), to_read)
+                except Exception:
+                    chunk = b""
+                if not chunk:
+                    break
+                buf += chunk
+                total_read += len(chunk)
+
+            consumed = 0
+            any_decoded = False
+            for ins in md.disasm(buf, cur_addr):
+                any_decoded = True
+                consumed = (ins.address + ins.size) - cur_addr
+                if printed >= count:
+                    break
+
+                src = (
+                    self.fas.get_line_covering(ins.address)
+                    or self.fas.get_line_exact(ins.address)
+                    or self.fas.get_line_near(ins.address)
+                )
+                if src:
+                    src_key = (src[0], src[1], src[2], src[3])
+                    if src_key != last_src_key:
+                        file_name, line_no, macro_name, generated = src
+                        header = ""
+                        if file_name:
+                            header += f"{C.YELLOW}{file_name}:{line_no}{C.RESET}"
+                        if generated and macro_name:
+                            if header:
+                                header += f"  {C.GRAY}(macro: {macro_name}){C.RESET}"
+                            else:
+                                header += (
+                                    f"{C.GRAY}macro: {macro_name}#{line_no}{C.RESET}"
+                                )
+                        if header:
+                            print(f"  ; {header}")
+                        last_src_key = src_key
+
+                mark = ""
+                if ins.address in self.breakpoints.values():
+                    mark = f"{C.RED}*{C.RESET}"
+                elif any(ins.address == w[0] for w in self.watchpoints.values()):
+                    mark = f"{C.RED}w{C.RESET}"
+
+                sym = self.addr2sym.get(ins.address)
+                if not sym:
+                    near = self._nearest_symbol(ins.address)
+                    if near and near[2] == 0:
+                        sym = near[0]
+                if sym:
+                    print(f"{C.MAGENTA}{sym}:{C.RESET}")
+
+                ann_txt = ""
+                if self._show_ann:
+                    anns = self._annotate_operands(ins)
+                    if anns:
+                        ann_txt = f"  {C.GRAY}; " + " ".join(anns) + C.RESET
+
+                bytes_txt = ""
+                if self._show_bytes:
+                    try:
+                        raw = bytes(ins.bytes[:8])
+                        bytes_txt = " " + " ".join(f"{b:02x}" for b in raw)
+                    except Exception:
+                        bytes_txt = ""
+
+                print(
+                    f"  {C.DIM}0x{ins.address:08x}:{C.RESET}{bytes_txt} {C.BOLD}{ins.mnemonic}{C.RESET} {ins.op_str}{mark}{ann_txt}"
+                )
+                printed += 1
+
+                if ins.id in (X86_INS_RET, X86_INS_RETF):
+                    break
+
+            if not any_decoded:
                 break
 
-            src = self.fas.get_line_exact(ins.address) or self.fas.get_line_near(
-                ins.address
-            )
-            if src:
-                src_key = (src[0], src[1], src[2], src[3])
-                if src_key != last_src_key:
-                    file_name, line_no, macro_name, generated = src
-                    header = ""
-                    if file_name:
-                        header += f"{C.YELLOW}{file_name}:{line_no}{C.RESET}"
-                    if generated and macro_name:
-                        if header:
-                            header += f"  {C.GRAY}(macro: {macro_name}){C.RESET}"
-                        else:
-                            header += f"{C.GRAY}macro: {macro_name}#{line_no}{C.RESET}"
-                    if header:
-                        print(f"  ; {header}")
-                    last_src_key = src_key
+            if consumed > 0:
+                buf = buf[consumed:]
+                cur_addr += consumed
+            else:
+                break
 
-            mark = ""
-            if ins.address in self.breakpoints.values():
-                mark = f"{C.RED}*{C.RESET}"
-            elif any(ins.address == w[0] for w in self.watchpoints.values()):
-                mark = f"{C.RED}w{C.RESET}"
-
-            sym = self.addr2sym.get(ins.address)
-            if not sym:
-                near = self._nearest_symbol(ins.address)
-                if near and near[2] == 0:
-                    sym = near[0]
-            if sym:
-                print(f"{C.MAGENTA}{sym}:{C.RESET}")
-
-            anns = self._annotate_operands(ins)
-            ann_txt = ""
-            if anns:
-                ann_txt = f"  {C.GRAY}; " + " ".join(anns) + C.RESET
-
-            print(
-                f"  {C.DIM}0x{ins.address:08x}:{C.RESET} {C.BOLD}{ins.mnemonic}{C.RESET} {ins.op_str}{mark}{ann_txt}"
-            )
-            printed += 1
-
-            if ins.id in (X86_INS_RET, X86_INS_RETF):
+            if printed >= count:
                 break
 
     def _read_u32(self, addr: int) -> Optional[int]:
@@ -768,7 +1071,11 @@ class ADbgCLI(cmd.Cmd):
 
     def _symbol_and_src(self, addr: int) -> str:
         sym_str = self._format_symbol(addr)
-        src = self.fas.get_line_exact(addr) or self.fas.get_line_near(addr)
+        src = (
+            self.fas.get_line_covering(addr)
+            or self.fas.get_line_exact(addr)
+            or self.fas.get_line_near(addr)
+        )
         if src and src[0]:
             return f"{sym_str} {C.GRAY}({src[0]}:{src[1]}){C.RESET}"
         elif src and src[2]:
@@ -1039,6 +1346,9 @@ class ADbgCLI(cmd.Cmd):
             addr = self.resolve(parts[0])
             length = int(parts[1], 0) if len(parts) >= 2 else 64
             size = int(parts[2], 0) if len(parts) >= 3 else 1
+            if length > 1048576:
+                print("peek: refusing to read more than 1 MiB")
+                return
             data = self.rsp.read_mem(addr, length)
             if size == 1:
                 hexdump(addr, data)
@@ -1070,6 +1380,9 @@ class ADbgCLI(cmd.Cmd):
                 )
             else:
                 data = payload.encode("utf-8", errors="surrogatepass")
+            if len(data) > 1048576:
+                print("poke: refusing to write more than 1 MiB")
+                return
             self.rsp.write_mem(addr, data)
             print(f"Wrote {len(data)} bytes at {C.BLUE}0x{addr:08x}{C.RESET}")
         except Exception as e:
@@ -1086,6 +1399,10 @@ class ADbgCLI(cmd.Cmd):
             addr = self.resolve(parts[0])
             value = int(parts[1], 0)
             count = int(parts[2], 0) if len(parts) >= 3 else 1
+            total = size * count
+            if total > 1048576:
+                print("poke: refusing to write more than 1 MiB")
+                return
             data = value.to_bytes(size, "little", signed=False) * count
             self.rsp.write_mem(addr, data)
             print(f"Wrote {count} x {size}-byte value at {C.BLUE}0x{addr:08x}{C.RESET}")
@@ -1118,6 +1435,9 @@ class ADbgCLI(cmd.Cmd):
                 fmt = "<" + fmt
             count = int(parts[2], 0) if len(parts) >= 3 else 1
             sz = pystruct.calcsize(fmt)
+            if sz * count > 1048576:
+                print("peekf: refusing to read more than 1 MiB")
+                return
             data = self.rsp.read_mem(addr, sz * count)
             for i in range(count):
                 tup = pystruct.unpack_from(fmt, data, i * sz)
@@ -1146,12 +1466,33 @@ class ADbgCLI(cmd.Cmd):
                 except ValueError:
                     vals.append(float(v))
             data = pystruct.pack(fmt, *vals)
+            if len(data) > 1048576:
+                print("pokef: refusing to write more than 1 MiB")
+                return
             self.rsp.write_mem(addr, data)
             print(
                 f"Wrote struct ({fmt}) of {len(data)} bytes at {C.BLUE}0x{addr:08x}{C.RESET}"
             )
         except Exception as e:
             print(f"pokef error: {e}")
+
+    def do_set(self, arg):
+        parts = arg.strip().split()
+        if len(parts) != 2:
+            print("Usage:\n  set asm intel|att\n  set bytes on|off\n  set ann on|off")
+            return
+        key, val = parts[0].lower(), parts[1].lower()
+        if key == "asm":
+            if val not in ("intel", "att"):
+                print("set asm: value must be 'intel' or 'att'")
+                return
+            self.dasm.set_syntax(val)
+        elif key == "bytes":
+            self._show_bytes = val == "on"
+        elif key == "ann":
+            self._show_ann = val == "on"
+        else:
+            print("Unknown setting. Use: asm | bytes | ann")
 
     def do_q(self, arg):
         return True
@@ -1161,6 +1502,336 @@ class ADbgCLI(cmd.Cmd):
 
     def do_exit(self, arg):
         return True
+
+    def help_hunt(self):
+        print(
+            "hunt [start|symbol|0xADDR|current] [max_steps N] [max_ms M] "
+            "[region BASE+LEN | region SYMBOL+LEN] [spin_thresh K] [window W] "
+            "[dot on|off] [disasm on|off]\n"
+            "Defaults: start=current, max_steps=50000, max_ms=2000, spin_thresh=512, "
+            "window=1024, dot=on, disasm=off"
+        )
+
+    def do_hunt(self, arg):
+        try:
+            parts = shlex.split(arg)
+        except Exception as e:
+            print(f"hunt: argument parse error: {e}")
+            return
+
+        start_mode = "current"
+        max_steps = 50000
+        max_ms = 2000
+        spin_thresh = 512
+        window = 1024
+        want_dot = True
+        want_disasm = False
+        region: Optional[Tuple[int, int]] = None
+
+        i = 0
+        while i < len(parts):
+            tok = parts[i].lower()
+            if tok in ("current",):
+                start_mode = "current"
+                i += 1
+            elif (
+                tok in ("start",)
+                or tok.startswith("0x")
+                or tok in self.sym2addr
+                or "+" in tok
+            ):
+                start_mode = parts[i]
+                i += 1
+            elif tok == "max_steps" and i + 1 < len(parts):
+                try:
+                    max_steps = int(parts[i + 1], 0)
+                except Exception:
+                    print("hunt: invalid max_steps")
+                    return
+                i += 2
+            elif tok == "max_ms" and i + 1 < len(parts):
+                try:
+                    max_ms = int(parts[i + 1], 0)
+                except Exception:
+                    print("hunt: invalid max_ms")
+                    return
+                i += 2
+            elif tok == "spin_thresh" and i + 1 < len(parts):
+                try:
+                    spin_thresh = int(parts[i + 1], 0)
+                except Exception:
+                    print("hunt: invalid spin_thresh")
+                    return
+                i += 2
+            elif tok == "window" and i + 1 < len(parts):
+                try:
+                    window = int(parts[i + 1], 0)
+                except Exception:
+                    print("hunt: invalid window")
+                    return
+                if window < 16:
+                    window = 16
+                i += 2
+            elif tok == "dot" and i + 1 < len(parts):
+                want_dot = parts[i + 1].lower() == "on"
+                i += 2
+            elif tok == "disasm" and i + 1 < len(parts):
+                want_disasm = parts[i + 1].lower() == "on"
+                i += 2
+            elif tok == "region" and i + 1 < len(parts):
+                reg = parts[i + 1]
+                if "+" not in reg:
+                    print("hunt: region expects BASE+LEN or SYMBOL+LEN")
+                    return
+                base_tok, len_tok = reg.split("+", 1)
+                try:
+                    base = self.resolve(base_tok)
+                    length = int(len_tok, 0)
+                    if length <= 0:
+                        print("hunt: region length must be > 0")
+                        return
+                    region = (base, base + length)
+                except Exception as e:
+                    print(f"hunt: invalid region: {e}")
+                    return
+                i += 2
+            else:
+                try:
+                    _ = self.resolve(parts[i])
+                    start_mode = parts[i]
+                    i += 1
+                except Exception:
+                    print(f"hunt: unrecognized token '{parts[i]}'")
+                    return
+
+        try:
+            regs0 = self.rsp.get_regs()
+        except Exception as e:
+            print(f"hunt: failed to read registers: {e}")
+            return
+        _ = self.dasm.update_mode(regs0)
+        if start_mode == "current":
+            start_eip = regs0["EIP"]
+        else:
+            try:
+                start_eip = self.resolve(start_mode)
+            except Exception as e:
+                print(f"hunt: cannot resolve start '{start_mode}': {e}")
+                return
+
+        def in_region(addr: int) -> bool:
+            if region is None:
+                return True
+            return region[0] <= addr < region[1]
+
+        cfg = CFG()
+        eip_window: deque = deque(maxlen=window)
+        flag_window: deque = deque(maxlen=min(128, window))
+        recent_edge_is_back: deque = deque(maxlen=window)
+        visited_nodes: set = set()
+
+        now = time.time()
+        t_start = now
+        steps = 0
+        reason = ""
+        reason_detail = ""
+        prev_eip = start_eip
+        if not in_region(prev_eip):
+            print("hunt: start outside region; nothing to do.")
+            return
+        cfg.add_node(prev_eip, now)
+        eip_window.append(prev_eip)
+        flag_window.append(regs0.get("EFLAGS", 0))
+        visited_nodes.add(prev_eip)
+
+        def detect_small_cycle(seq: deque, max_period=4, min_reps=4):
+            n = len(seq)
+            if n < max_period * min_reps:
+                return None
+            arr = list(seq)
+            for p in range(1, max_period + 1):
+                ok = True
+                for i in range(n - p):
+                    if arr[i] != arr[i + p]:
+                        ok = False
+                        break
+                if ok:
+                    pattern = arr[-p:]
+                    reps = n // p
+                    if reps >= min_reps:
+                        return pattern
+            return None
+
+        while True:
+            now = time.time()
+            if (now - t_start) * 1000.0 >= max_ms:
+                reason = "max time"
+                break
+            if steps >= max_steps:
+                reason = "max steps"
+                break
+
+            try:
+                self.rsp.step()
+                regs = self.rsp.get_regs()
+            except Exception as e:
+                reason = "RSP error"
+                reason_detail = str(e)
+                break
+
+            _ = self.dasm.update_mode(regs)
+            cur_eip = regs.get("EIP", 0)
+            cur_eflags = regs.get("EFLAGS", 0)
+            steps += 1
+
+            if not in_region(cur_eip):
+                cfg.add_edge(prev_eip, cur_eip, time.time())
+                reason = "left region"
+                break
+
+            ts = time.time()
+            cfg.add_edge(prev_eip, cur_eip, ts)
+            eip_window.append(cur_eip)
+            flag_window.append(cur_eflags)
+            back = cur_eip in visited_nodes
+            recent_edge_is_back.append(1 if back else 0)
+            visited_nodes.add(cur_eip)
+
+            if eip_window.count(cur_eip) >= spin_thresh:
+                reason = "suspected tight spin"
+                break
+
+            cyc = detect_small_cycle(eip_window, max_period=4, min_reps=6)
+            if cyc is not None:
+                reason = "small cycle"
+                reason_detail = f"pattern length {len(cyc)}"
+                break
+
+            if steps % 64 == 0:
+                scc_set, has_out = extract_scc_containing(cfg, cur_eip, region)
+                stayed = all(
+                    e in scc_set for e in list(eip_window)[-max(1, window // 2) :]
+                )
+                if stayed and not has_out and len(scc_set) >= 1:
+                    reason = "SCC no-exit"
+                    break
+
+            if len(recent_edge_is_back) >= 32:
+                take = min(len(recent_edge_is_back), window, steps)
+                last = list(recent_edge_is_back)[-take:]
+                if sum(last) / float(take) >= 0.95:
+                    reason = "back-edge dominance"
+                    break
+
+            if len(flag_window) >= min(128, window):
+                flags_same = all(f == flag_window[0] for f in flag_window)
+                few_ips = len(set(eip_window)) <= 4
+                if flags_same and few_ips:
+                    reason = "low state change"
+                    break
+
+            prev_eip = cur_eip
+
+        try:
+            regs_end = self.rsp.get_regs()
+        except Exception:
+            regs_end = {"EIP": prev_eip}
+        t_end = time.time()
+        cur_node = regs_end.get("EIP", prev_eip)
+
+        print(
+            f"{C.BOLD}hunt result:{C.RESET} {reason}"
+            + (f" — {reason_detail}" if reason_detail else "")
+        )
+        if region:
+            rtxt = f"[0x{region[0]:08x}..0x{region[1]-1:08x}]"
+        else:
+            rtxt = "(unconstrained)"
+        unique_nodes = len(cfg.visits)
+        unique_edges = sum(1 for _ in cfg.edges())
+        print(
+            f"  steps={steps}  nodes={unique_nodes}  edges={unique_edges}  "
+            f"region={rtxt}  start={time.strftime('%H:%M:%S', time.localtime(t_start))}  "
+            f"end={time.strftime('%H:%M:%S', time.localtime(t_end))}"
+        )
+        try:
+            start_sym = self._format_symbol(start_eip)
+            end_sym = self._format_symbol(cur_node)
+        except Exception:
+            start_sym = f"0x{start_eip:08x}"
+            end_sym = f"0x{cur_node:08x}"
+        print(f"  start @ {start_sym}")
+        print(f"  end   @ {end_sym}")
+
+        print(f"\n{C.BOLD}Top nodes by visits:{C.RESET}")
+        for addr, cnt in cfg.top_nodes(10):
+            print(f"  {cnt:8d}  {self._format_symbol(addr)}")
+
+        print(f"\n{C.BOLD}Top edges by traversals:{C.RESET}")
+        t_edges = cfg.top_edges(10)
+        if not t_edges:
+            print("  (none)")
+        else:
+            for u, v, c in t_edges:
+                print(
+                    f"  {c:8d}  {self._format_symbol(u)}  ->  {self._format_symbol(v)}"
+                )
+
+        scc_set, has_out = extract_scc_containing(cfg, cur_node, region)
+        render_whole = unique_nodes <= 200
+        target_nodes = set(cfg.nodes()) if render_whole else scc_set
+        if not render_whole:
+            print(
+                f"\n{C.BOLD}Suspected SCC size:{C.RESET} {len(scc_set)}  (has_out={has_out})"
+            )
+
+        if want_dot:
+            dot_nodes = target_nodes
+            if len(dot_nodes) > 300:
+                print("\nDOT graph skipped (too large >300 nodes).")
+            else:
+                print(f"\n{C.BOLD}DOT graph:{C.RESET}")
+                print("```dot")
+                print("digraph CFG {")
+                print('  graph [rankdir=LR, bgcolor="white"];')
+                print(
+                    '  node [shape=box, style="rounded,filled", fillcolor="lightgray", fontname="monospace", fontsize=10];'
+                )
+                for a in sorted(dot_nodes):
+                    mark = "bold" if a == cur_node else "solid"
+                    label = self._format_symbol(a).replace('"', '\\"')
+                    print(
+                        f'  n{a:x} [label="{label}", penwidth=1.2, color="black", style="{mark},filled"];'
+                    )
+                edge_count_printed = 0
+                edge_cap = 2000
+                for u in sorted(dot_nodes):
+                    for v, c in cfg.adj.get(u, {}).items():
+                        if v in dot_nodes:
+                            print(f'  n{u:x} -> n{v:x} [label="{c}", color="black"];')
+                            edge_count_printed += 1
+                            if edge_count_printed >= edge_cap:
+                                print("  // (... truncated ...)")
+                                u = None
+                                break
+                    if u is None:
+                        break
+                print("}")
+                print("```")
+
+        if want_disasm:
+            print(f"\n{C.BOLD}Disassembly of suspected nodes:{C.RESET}")
+            to_show = (
+                list(sorted(scc_set))[:32]
+                if not render_whole
+                else list(sorted(target_nodes))[:32]
+            )
+            for a in to_show:
+                print(f"{C.MAGENTA}{self._format_symbol(a)}:{C.RESET}")
+                try:
+                    self.print_disasm(3, a)
+                except Exception as e:
+                    print(f"  disasm error: {e}")
 
     def do_EOF(self, arg):
         print()
@@ -1183,7 +1854,37 @@ def main() -> int:
         default="32",
         help="default register view width for `regs`/`reg`",
     )
+    parser.add_argument(
+        "--color",
+        choices=["auto", "always", "never"],
+        default="auto",
+        help="color output",
+    )
+    vq = parser.add_mutually_exclusive_group()
+    vq.add_argument("--quiet", action="store_true", help="only warnings and errors")
+    vq.add_argument("--verbose", action="store_true", help="debug logging")
     args = parser.parse_args()
+
+    level = logging.INFO
+    if args.quiet:
+        level = logging.WARNING
+    elif args.verbose:
+        level = logging.DEBUG
+    logging.getLogger().setLevel(level)
+    for h in logging.getLogger().handlers:
+        try:
+            h.setLevel(level)
+        except Exception:
+            pass
+    logger.setLevel(level)
+
+    global C
+    if args.color == "always":
+        C = _Colors(True)
+    elif args.color == "never":
+        C = _Colors(False)
+    else:
+        C = _Colors(_color_enabled())
 
     paths = [p.strip() for p in args.fas_file.split(",") if p.strip()]
     if not paths:
@@ -1194,6 +1895,7 @@ def main() -> int:
     merged_addr2sym: Dict[int, str] = {}
     fas_list: List[FasFile] = []
     loaded_any = False
+    merged_conflicts: Dict[str, List[int]] = {}
 
     for p in paths:
         try:
@@ -1203,6 +1905,7 @@ def main() -> int:
                 if name not in merged_sym2addr:
                     merged_sym2addr[name] = addr
                 elif merged_sym2addr[name] != addr:
+                    merged_conflicts.setdefault(name, []).append(addr)
                     logger.warning(
                         "Symbol '%s' address conflict: 0x%x vs 0x%x (keeping first)",
                         name,
@@ -1244,6 +1947,7 @@ def main() -> int:
         fas_merged,
         default_reg_width=int(args.reg_width),
     )
+    cli._sym_conflicts = merged_conflicts
 
     signal.signal(signal.SIGINT, lambda s, f: cli.do_quit(None))
     cli.cmdloop()
